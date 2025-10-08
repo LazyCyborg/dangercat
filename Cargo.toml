@@ -24,9 +24,20 @@ log = "0.4.27"
 
 # You only need serde if you want app persistence:
 serde = { version = "1.0.219", features = ["derive"] }
+local-edf-reader = "0.1.0"
+edf-reader = "0.4.0"
+egui-file-dialog = "0.11.0"
+egui_plot = "0.33.0"
+ndarray = "0.16.1"
+sci-rs = "0.4.1"
+cubic_spline = "1.0.0"
+num-traits = "0.2.19"
+rustfft = "6.4.1"
+nalgebra = "0.33.2"
+rayon = "1.11.0"
 
 # native:
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(targt_arch = "wasm32"))'.dependencies]
 env_logger = "0.11.8"
 
 # web:

@@ -1,0 +1,471 @@
+
+use std::iter::Sum;
+use rayon::prelude::*;
+use ndarray::{s, Array2, Array3};
+use sci_rs::signal::filter::{design::*, sosfiltfilt_dyn};
+use sci_rs::na::RealField;
+use num_traits::Float;
+use cubic_spline::SplineOpts;
+
+use crate::Markers;
+use crate::EEGInfo;
+
+// Helper functions
+pub fn vec_to_ndarray<T: Clone>(v: &Vec<Vec<T>>) -> Array2<T> {
+    if v.is_empty() {
+        return Array2::from_shape_vec((0, 0), Vec::new()).unwrap();
+    }
+    let nrows = v.len();
+    let ncols = v[0].len();
+    let mut data = Vec::with_capacity(nrows * ncols);
+    for row in v {
+        assert_eq!(row.len(), ncols);
+        data.extend_from_slice(&row);
+    }
+    Array2::from_shape_vec((nrows, ncols), data).unwrap()
+}
+
+pub fn vec_to_ndarray3<T: Clone>(v: Vec<Vec<Vec<T>>>) -> Array3<T> {
+    if v.is_empty() {
+        return Array3::from_shape_vec((0, 0, 0), Vec::new()).unwrap();
+    }
+    let d1 = v.len();
+    let d2 = v[0].len();
+    let d3 = v[0][0].len();
+
+    let mut flat_data = Vec::with_capacity(d1 * d2 * d3);
+
+    for d1_vec in &v {
+        assert_eq!(d1_vec.len(), d2);
+        for d2_vec in d1_vec {
+            assert_eq!(d2_vec.len(), d3);
+            flat_data.extend_from_slice(d2_vec);
+        }
+    }
+
+    Array3::from_shape_vec((d1, d2, d3), flat_data).unwrap()
+}
+
+pub fn get_one_channel(ch_idx: usize, eeg_data: &Array2<i16>) -> Result<Vec<i16>, Box<dyn std::error::Error>>{
+    if eeg_data.is_empty(){
+        return Err("Data is empty..".into());
+    }
+    let ch_data = eeg_data.row(ch_idx).clone();
+    let ch_vec = ch_data.to_vec();
+    Ok(ch_vec)
+}
+
+
+// Replace interval around of the TMS pulse with 0
+pub fn remove_tms_pulse(
+    tmin_cut: f64,
+    tmax_cut: f64,
+    markers: &Markers,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<i16>,
+) -> Result<Array2<i16>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let mut data_copy = eeg_data.clone();
+    let n_samples = data_copy.ncols();
+
+    let min_samples = (tmin_cut * eeg_info.sfreq as f64).round() as usize;
+    let max_samples = (tmax_cut * eeg_info.sfreq as f64).round() as usize;
+
+    for &marker_pos in &markers.markers {
+        let marker_idx = marker_pos.round() as usize;
+
+        let start_cut = marker_idx.saturating_sub(min_samples);
+        let end_cut = (marker_idx + max_samples).min(n_samples);
+        if start_cut >= end_cut {
+            continue;
+        }
+        for ch_idx in 0..data_copy.nrows() {
+            let mut slice = data_copy.slice_mut(s![ch_idx, start_cut..end_cut]);
+
+            slice.fill(0);
+        }
+    }
+
+    Ok(data_copy)
+}
+
+
+// r
+pub fn rm_interp_tms_pulse(
+    tmin_cut: f64,
+    tmax_cut: f64,
+    markers: &Markers,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<i16>,
+) -> Result<Array2<i16>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let mut data_copy = eeg_data.clone();
+    let n_samples = data_copy.ncols();
+    let min_samples = (tmin_cut * eeg_info.sfreq as f64).round() as usize;
+    let max_samples = (tmax_cut * eeg_info.sfreq as f64).round() as usize;
+
+    for &marker_pos in &markers.markers {
+        let marker_idx = marker_pos.round() as usize;
+        let start_cut = marker_idx.saturating_sub(min_samples);
+        let end_cut = (marker_idx + max_samples).min(n_samples);
+        if start_cut >= end_cut {
+            continue;
+        }
+        for ch_idx in 0..data_copy.nrows() {
+                    if start_cut == 0 || end_cut >= n_samples {
+                        data_copy.slice_mut(s![ch_idx, start_cut..end_cut]).fill(0);
+                        continue;
+                    }
+                    let p1_x = (start_cut - 1) as f64;
+                    let p1_y = data_copy[[ch_idx, start_cut - 1]] as f64;
+                    let p2_x = end_cut as f64;
+                    let p2_y = data_copy[[ch_idx, end_cut]] as f64;
+
+                    let source_points = vec![(p1_x, p1_y), (p2_x, p2_y)];
+                    let gap_len = end_cut - start_cut;
+                    if gap_len == 0 { continue; }
+                    let opts = SplineOpts::new().num_of_segments(gap_len as u32);
+
+                    let points = <cubic_spline::Points as cubic_spline::TryFrom<_>>::try_from(&source_points)?;
+                    let calculated_points = points.calc_spline(&opts)?;
+
+                    for i in 0..gap_len {
+                        let new_y = calculated_points.get_ref()[i + 1].y;
+                        data_copy[[ch_idx, start_cut + i]] = new_y.round() as i16;
+                    }
+                }
+    }
+    Ok(data_copy)
+}
+
+
+
+pub fn remove_tms_pulse_f32(
+    tmin_cut: f64,
+    tmax_cut: f64,
+    markers: &Markers,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<f32>,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+
+    let mut data_copy = eeg_data.clone();
+    let n_samples = data_copy.ncols();
+    let min_samples = (tmin_cut * eeg_info.sfreq as f64).round() as usize;
+    let max_samples = (tmax_cut * eeg_info.sfreq as f64).round() as usize;
+
+    for &marker_pos in &markers.markers {
+        let marker_idx = marker_pos.round() as usize;
+        let start_cut = marker_idx.saturating_sub(min_samples);
+        let end_cut = (marker_idx + max_samples).min(n_samples);
+        if start_cut >= end_cut {
+            continue;
+        }
+        for ch_idx in 0..data_copy.nrows() {
+            let mut slice = data_copy.slice_mut(s![ch_idx, start_cut..end_cut]);
+            slice.fill(0.0);
+        }
+    }
+    Ok(data_copy)
+}
+
+pub fn rm_interp_tms_pulse_f32(
+    tmin_cut: f64,
+    tmax_cut: f64,
+    markers: &Markers,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<f32>,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let mut data_copy = eeg_data.clone();
+    let n_samples = data_copy.ncols();
+    let min_samples = (tmin_cut * eeg_info.sfreq as f64).round() as usize;
+    let max_samples = (tmax_cut * eeg_info.sfreq as f64).round() as usize;
+
+    for &marker_pos in &markers.markers {
+        let marker_idx = marker_pos.round() as usize;
+        let start_cut = marker_idx.saturating_sub(min_samples);
+        let end_cut = (marker_idx + max_samples).min(n_samples);
+        if start_cut >= end_cut {
+            continue;
+        }
+        for ch_idx in 0..data_copy.nrows() {
+            if start_cut == 0 || end_cut >= n_samples {
+                data_copy.slice_mut(s![ch_idx, start_cut..end_cut]).fill(0.0);
+                continue;
+            }
+            let p1_x = (start_cut - 1) as f64;
+            let p1_y = data_copy[[ch_idx, start_cut - 1]] as f64;
+            let p2_x = end_cut as f64;
+            let p2_y = data_copy[[ch_idx, end_cut]] as f64;
+
+            let source_points = vec![(p1_x, p1_y), (p2_x, p2_y)];
+            let gap_len = end_cut - start_cut;
+            if gap_len == 0 { continue; }
+            let opts = SplineOpts::new().num_of_segments(gap_len as u32);
+
+            let points = <cubic_spline::Points as cubic_spline::TryFrom<_>>::try_from(&source_points)?;
+            let calculated_points = points.calc_spline(&opts)?;
+
+            for i in 0..gap_len {
+                let new_y = calculated_points.get_ref()[i + 1].y;
+                data_copy[[ch_idx, start_cut + i]] = new_y as f32;
+            }
+        }
+    }
+    Ok(data_copy)
+}
+
+
+pub fn design_butter_lp<F>(order: usize, lowcut: F, fs: F) -> Vec<Sos<F>>
+where
+    F: Float + RealField + Sum,
+{
+    //print!("Building Butterworth filter of order {:?} with lowcut {:?}", order, lowcut);
+    // Design Second Order Section (SOS) filter
+    let filter = butter_dyn(
+        order,
+        [lowcut].to_vec(),
+        Some(FilterBandType::Lowpass),
+        Some(false),
+        Some(FilterOutputType::Sos),
+        Some(fs),
+    );
+    let DigitalFilter::Sos(SosFormatFilter {sos}) = filter else {
+        panic!("Failed to design filter");
+    };
+    sos
+}
+
+pub fn design_butter_hp<F>(order: usize, highcut: F, fs: F) -> Vec<Sos<F>>
+where
+    F: Float + RealField + Sum,
+{
+    //print!("Building Butterworth filter of order {:?} with highcut {:?}", order, highcut);
+    // Design Second Order Section (SOS) filter
+    let filter = butter_dyn(
+        order,
+        [highcut].to_vec(),
+        Some(FilterBandType::Highpass),
+        Some(false),
+        Some(FilterOutputType::Sos),
+        Some(fs),
+    );
+    let DigitalFilter::Sos(SosFormatFilter {sos}) = filter else {
+        panic!("Failed to design filter");
+    };
+    sos
+}
+
+
+pub fn hp_filter(
+    lfreq: f64,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<i16>,
+) -> Result<Array2<i16>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_butter_hp(2, lfreq, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<i16>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample.round() as i16)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
+
+pub fn lp_filter(
+    hfreq: f64,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<i16>,
+) -> Result<Array2<i16>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_butter_lp(2, hfreq, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<i16>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample.round() as i16)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
+
+
+pub fn edf_hp_filter(
+    lfreq: f64,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<f32>,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_butter_hp(2, lfreq, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<f32>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample.round() as f32)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
+
+pub fn edf_lp_filter(
+    hfreq: f64,
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<f32>,
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_butter_lp(2, hfreq, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<f32>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample.round() as f32)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
+
+
+pub fn design_notch<F>(freq: F, fs: F) -> Vec<Sos<F>>
+where
+    F: Float + RealField + Sum,
+{
+    let band = [freq - F::one(), freq + F::one()];
+
+    let filter = butter_dyn(
+        2,  // Order
+        band.to_vec(),
+        Some(FilterBandType::Bandstop),
+        Some(false),
+        Some(FilterOutputType::Sos),
+        Some(fs),
+    );
+    match filter {
+        DigitalFilter::Sos(SosFormatFilter { sos }) => sos,
+        _ => panic!("Failed to design notch filter"),
+    }
+}
+
+pub fn notch_filter_50hz(
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<i16>
+) -> Result<Array2<i16>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_notch(50.0, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<i16>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample.round() as i16)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
+
+pub fn edf_notch_filter_50hz(
+    eeg_info: &EEGInfo,
+    eeg_data: &Array2<f32>
+) -> Result<Array2<f32>, Box<dyn std::error::Error>> {
+    if eeg_data.is_empty() {
+        return Ok(Array2::from_shape_vec((0, 0), Vec::new()).unwrap());
+    }
+
+    let sos = design_notch(50.0, eeg_info.sfreq as f64);
+    let n_channels = eeg_data.nrows();
+
+    let data_vec_vec: Vec<Vec<f32>> = (0..n_channels)
+        .into_par_iter()
+        .map(|ch_idx| {
+            let channel = eeg_data.row(ch_idx);
+            let filtered: Vec<f64> = sosfiltfilt_dyn(
+                channel.into_iter().map(|sample| *sample as f64),
+                &sos
+            );
+            filtered.into_iter()
+                .map(|sample| sample as f32)
+                .collect()
+        })
+        .collect();
+
+    let data = vec_to_ndarray(&data_vec_vec);
+    Ok(data)
+}
